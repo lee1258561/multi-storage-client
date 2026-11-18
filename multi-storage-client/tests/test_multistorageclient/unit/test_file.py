@@ -628,6 +628,94 @@ def test_posix_file_readall_emits_read_metrics_once(tmp_path):
         assert emit_metrics.call_count == 1
 
 
+def _posix_client(tmp_path, **options):
+    return StorageClient(
+        StorageClientConfig.from_dict(
+            {
+                "profiles": {
+                    "data": {"storage_provider": {"type": "file", "options": {"base_path": str(tmp_path), **options}}}
+                }
+            },
+            profile="data",
+        )
+    )
+
+
+def _record_page_cache_calls(monkeypatch) -> list:
+    calls = []
+    monkeypatch.setattr(os, "fdatasync", lambda fd: calls.append("fdatasync"))
+    monkeypatch.setattr(os, "posix_fadvise", lambda fd, offset, length, advice: calls.append((offset, length, advice)))
+    return calls
+
+
+linux_only = pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="drop_page_cache_window_bytes is Linux-only")
+
+
+@linux_only
+def test_posix_file_drops_written_pages_in_windows_and_the_whole_file_at_close(tmp_path, monkeypatch):
+    calls = _record_page_cache_calls(monkeypatch)
+    storage_client = _posix_client(tmp_path, drop_page_cache_window_bytes=16 * 1024)
+    chunks = [bytes([i]) * (10 * 1024) for i in range(5)]
+    with storage_client.open("file.bin", "wb") as f:
+        for chunk in chunks:
+            f.write(chunk)
+        assert not (tmp_path / "file.bin").exists()
+
+    dontneed = os.POSIX_FADV_DONTNEED
+    assert calls == [
+        "fdatasync",
+        (0, 20 * 1024, dontneed),
+        "fdatasync",
+        (20 * 1024, 20 * 1024, dontneed),
+        "fdatasync",
+        (0, 0, dontneed),
+    ], "each window is on storage before it is dropped, and close drops the whole file before the rename"
+    assert (tmp_path / "file.bin").read_bytes() == b"".join(chunks)
+
+
+@linux_only
+def test_posix_writes_drop_their_pages_once_with_a_zero_window(tmp_path, monkeypatch):
+    calls = _record_page_cache_calls(monkeypatch)
+    storage_client = _posix_client(tmp_path, drop_page_cache_window_bytes=0)
+    once = ["fdatasync", (0, 0, os.POSIX_FADV_DONTNEED)]
+
+    with storage_client.open("file.bin", "wb") as f:
+        f.write(b"\x01" * 64 * 1024)
+    assert calls == once
+    calls.clear()
+    with storage_client.open("file.txt", "w") as f:
+        f.write("text")
+    assert calls == once
+    calls.clear()
+    storage_client.write("written.bin", b"\x02" * 64 * 1024)
+    assert calls == once
+    calls.clear()
+    storage_client.copy("written.bin", "copied.bin")
+    assert calls == once
+    assert (tmp_path / "copied.bin").read_bytes() == b"\x02" * 64 * 1024
+
+
+def test_posix_writes_keep_their_page_cache_by_default(tmp_path, monkeypatch):
+    calls = _record_page_cache_calls(monkeypatch)
+    storage_client = _posix_client(tmp_path)
+    with storage_client.open("file.bin", "wb") as f:
+        f.write(b"\x01" * 64 * 1024)
+    storage_client.write("written.bin", b"\x02" * 64 * 1024)
+    assert calls == []
+
+
+@linux_only
+def test_posix_writes_that_drop_their_page_cache_keep_their_bytes(tmp_path):
+    storage_client = _posix_client(tmp_path, drop_page_cache_window_bytes=64 * 1024)
+    data = os.urandom(300 * 1024)
+    with storage_client.open("file.bin", "wb") as f:
+        f.write(data[:100])
+        f.write(data[100:])
+    storage_client.write("written.bin", data)
+    assert (tmp_path / "file.bin").read_bytes() == data
+    assert (tmp_path / "written.bin").read_bytes() == data
+
+
 def _object_file_client(tmp_path):
     return SingleStorageClient(
         StorageClientConfig.from_dict(

@@ -20,7 +20,15 @@ import tempfile
 from io import StringIO
 from unittest.mock import patch
 
+import pytest
+
 from multistorageclient.providers.posix_file import PosixFileStorageProvider
+
+
+@pytest.mark.parametrize("window_bytes", [-1, 1.5, "1024", True])
+def test_drop_page_cache_window_bytes_must_be_a_non_negative_integer(tmp_path, window_bytes):
+    with pytest.raises(ValueError, match="drop_page_cache_window_bytes"):
+        PosixFileStorageProvider(base_path=str(tmp_path), drop_page_cache_window_bytes=window_bytes)
 
 
 def test_list_objects_with_ascending_order():

@@ -57,7 +57,50 @@ class _EntryType(Enum):
     SYMLINK = 4
 
 
-def atomic_write(source: str | IO, destination: str, attributes: dict[str, str] | None = None):
+_CAN_DROP_PAGE_CACHE = hasattr(os, "fdatasync") and hasattr(os, "posix_fadvise")
+
+
+class _PageCacheDropper:
+    """
+    Flushes the bytes written to an open file to storage and drops them from the page cache.
+
+    :py:func:`os.posix_fadvise` with ``POSIX_FADV_DONTNEED`` skips dirty pages, so each range is
+    ``fdatasync``-ed first.
+    """
+
+    def __init__(self, file: IO, window_bytes: int) -> None:
+        """
+        :param file: The open file being written.
+        :param window_bytes: Flush and drop after this many bytes are written; ``0`` drops only in :py:meth:`finish`.
+        """
+        self._file = file
+        self._window_bytes = window_bytes
+        self._dropped = file.tell() if window_bytes else 0
+
+    def written(self) -> None:
+        """Call after each write."""
+        if self._window_bytes and self._file.tell() - self._dropped >= self._window_bytes:
+            end = self._sync()
+            os.posix_fadvise(self._file.fileno(), self._dropped, end - self._dropped, os.POSIX_FADV_DONTNEED)
+            self._dropped = end
+
+    def finish(self) -> None:
+        """Flush the whole file to storage and drop all of its pages; call before closing it."""
+        self._sync()
+        os.posix_fadvise(self._file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+
+    def _sync(self) -> int:
+        self._file.flush()
+        os.fdatasync(self._file.fileno())
+        return self._file.tell()
+
+
+def atomic_write(
+    source: str | IO,
+    destination: str,
+    attributes: dict[str, str] | None = None,
+    drop_page_cache_window_bytes: int | None = None,
+):
     """
     Writes the contents of a file to the specified destination path.
 
@@ -67,17 +110,25 @@ def atomic_write(source: str | IO, destination: str, attributes: dict[str, str] 
     :param source: The input file to read from. It can be a string representing the path to a file, or an open file-like object (IO).
     :param destination: The path to the destination file where the contents should be written.
     :param attributes: The attributes to set on the file.
+    :param drop_page_cache_window_bytes: When set, flush the written bytes to storage and drop them from the page cache every this many bytes (``0``: once, before the rename).
     """
 
     with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=os.path.dirname(destination), prefix=".") as fp:
         temp_file_path = fp.name
+        dropper = None if drop_page_cache_window_bytes is None else _PageCacheDropper(fp, drop_page_cache_window_bytes)
         if isinstance(source, str):
             with open(source, mode="rb") as src:
                 while chunk := src.read(READ_CHUNK_SIZE):
                     fp.write(chunk)
+                    if dropper is not None:
+                        dropper.written()
         else:
             while chunk := source.read(READ_CHUNK_SIZE):
                 fp.write(chunk)
+                if dropper is not None:
+                    dropper.written()
+        if dropper is not None:
+            dropper.finish()
 
         # Set attributes on temp file if provided
         validated_attributes = validate_attributes(attributes)
@@ -100,13 +151,34 @@ class PosixFileStorageProvider(BaseStorageProvider):
         base_path: str,
         config_dict: dict[str, Any] | None = None,
         telemetry_provider: Callable[[], Telemetry] | None = None,
+        drop_page_cache_window_bytes: int | None = None,
         **kwargs: Any,
     ) -> None:
         """
         :param base_path: The root prefix path within the POSIX file system where all operations will be scoped.
         :param config_dict: Resolved MSC config.
         :param telemetry_provider: A function that provides a telemetry instance.
+        :param drop_page_cache_window_bytes: Keep written files out of the page cache. Unset (default), written
+            pages stay cached as with any buffered write. ``0``: a file is flushed to storage (``fdatasync``) and its
+            pages dropped (``POSIX_FADV_DONTNEED``) when it is closed. A positive value also flushes and drops every
+            that many bytes while a binary file is written, which bounds its cached and dirty pages. Applies to
+            files opened for writing and to ``write``, ``upload_file`` and ``copy``. Linux only; ignored with a
+            warning elsewhere.
         """
+        if drop_page_cache_window_bytes is not None and (
+            isinstance(drop_page_cache_window_bytes, bool)
+            or not isinstance(drop_page_cache_window_bytes, int)
+            or drop_page_cache_window_bytes < 0
+        ):
+            raise ValueError(
+                f"drop_page_cache_window_bytes must be a non-negative integer, got {drop_page_cache_window_bytes!r}"
+            )
+        if drop_page_cache_window_bytes is not None and not _CAN_DROP_PAGE_CACHE:
+            logger.warning(
+                "drop_page_cache_window_bytes needs fdatasync and posix_fadvise; ignoring it on this platform"
+            )
+            drop_page_cache_window_bytes = None
+        self._drop_page_cache_window_bytes = drop_page_cache_window_bytes
 
         # Validate POSIX path
         if base_path == "":
@@ -155,7 +227,12 @@ class PosixFileStorageProvider(BaseStorageProvider):
     ) -> int:
         def _invoke_api() -> int:
             safe_makedirs(os.path.dirname(path))
-            atomic_write(source=BytesIO(body), destination=path, attributes=attributes)
+            atomic_write(
+                source=BytesIO(body),
+                destination=path,
+                attributes=attributes,
+                drop_page_cache_window_bytes=self._drop_page_cache_window_bytes,
+            )
             return len(body)
 
         return self._translate_errors(_invoke_api, operation="PUT", path=path)
@@ -184,7 +261,12 @@ class PosixFileStorageProvider(BaseStorageProvider):
 
         def _invoke_api() -> int:
             safe_makedirs(os.path.dirname(dest_path))
-            atomic_write(source=src_path, destination=dest_path, attributes=src_object.metadata)
+            atomic_write(
+                source=src_path,
+                destination=dest_path,
+                attributes=src_object.metadata,
+                drop_page_cache_window_bytes=self._drop_page_cache_window_bytes,
+            )
 
             return src_object.content_length
 
@@ -500,7 +582,12 @@ class PosixFileStorageProvider(BaseStorageProvider):
             filesize = len(f.getvalue())  # type: ignore
 
         def _invoke_api() -> int:
-            atomic_write(source=f, destination=remote_path, attributes=attributes)
+            atomic_write(
+                source=f,
+                destination=remote_path,
+                attributes=attributes,
+                drop_page_cache_window_bytes=self._drop_page_cache_window_bytes,
+            )
 
             return filesize
 

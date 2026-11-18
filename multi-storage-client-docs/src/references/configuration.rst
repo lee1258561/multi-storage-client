@@ -257,6 +257,26 @@ MSC includes a default POSIX filesystem profile named ``__filesystem__``. When t
          options:
            base_path: /
 
+Files written through the ``file`` provider stay in the page cache, as with any buffered write. For large write-once
+files such as checkpoints on a shared filesystem, that cache is charged to the writing process's cgroup and can hold
+the whole file, much of it dirty, until reclaim. ``drop_page_cache_window_bytes`` flushes written data to storage
+(``fdatasync``) and drops it from the page cache (``POSIX_FADV_DONTNEED``) every that many bytes and when a file is
+closed (``0``: only when it is closed). The ``__filesystem__`` profile cannot be changed, so map local paths to a profile
+that sets the option with ``path_mapping``:
+
+.. code-block:: yaml
+   :caption: Example configuration.
+
+   profiles:
+     checkpoints:
+       storage_provider:
+         type: file
+         options:
+           base_path: /mnt/checkpoints
+           drop_page_cache_window_bytes: 1073741824
+   path_mapping:
+     /mnt/checkpoints/: msc://checkpoints/
+
 ``s3``
 ------
 

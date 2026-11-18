@@ -34,6 +34,7 @@ from .cache import CacheManager
 from .constants import MEMORY_LOAD_LIMIT
 from .instrumentation.utils import file_metrics
 from .providers.base import BaseStorageProvider
+from .providers.posix_file import _PageCacheDropper
 from .types import Range, SourceVersionCheckMode
 from .utils import safe_makedirs, validate_attributes
 
@@ -771,6 +772,13 @@ class PosixFile(IOBase, IO):
         else:
             self._file = open(self._real_path, mode=mode, buffering=buffering, encoding=encoding)  # noqa: SIM115
 
+        window_bytes = getattr(storage_provider, "_drop_page_cache_window_bytes", None)
+        self._page_cache_dropper = (
+            _PageCacheDropper(self._file, window_bytes if "b" in mode else 0)
+            if window_bytes is not None and ("w" in mode or "a" in mode)
+            else None
+        )
+
         self._file_descriptor_open_time = time.perf_counter()
         self._file_descriptor_close_callback: Callable[[float], None] | None = None
         try:
@@ -844,11 +852,16 @@ class PosixFile(IOBase, IO):
 
     @file_metrics(operation=BaseStorageProvider._Operation.WRITE)
     def write(self, b: Any) -> int:
-        return self._file.write(b)
+        written = self._file.write(b)
+        if self._page_cache_dropper is not None:
+            self._page_cache_dropper.written()
+        return written
 
     @file_metrics(operation=BaseStorageProvider._Operation.WRITE)
     def writelines(self, lines: Any) -> None:
         self._file.writelines(lines)
+        if self._page_cache_dropper is not None:
+            self._page_cache_dropper.written()
 
     @file_metrics(operation=BaseStorageProvider._Operation.WRITE)
     def truncate(self, size: int | None = None) -> int:
@@ -878,10 +891,14 @@ class PosixFile(IOBase, IO):
             return
 
         try:
-            self._file.close()
+            if self._page_cache_dropper is not None:
+                self._page_cache_dropper.finish()
         finally:
-            if self._file.closed:
-                self._record_file_descriptor_release()
+            try:
+                self._file.close()
+            finally:
+                if self._file.closed:
+                    self._record_file_descriptor_release()
 
         if self._atomic and "w" in self._mode:
             # Rename the temporary file to the target file
