@@ -327,7 +327,7 @@ class S3StorageProvider(BaseStorageProvider):
 
         self._rust_client = None
         self._rust_bucket: str | None = None
-        self._streaming_write: _StreamingWriteOptions | None = None
+        self._streaming_write_options: _StreamingWriteOptions | None = None
         if "rust_client" in kwargs:
             # Inherit the rust client options from the kwargs
             rust_client_options = kwargs["rust_client"]
@@ -356,7 +356,7 @@ class S3StorageProvider(BaseStorageProvider):
                         f"Disable rust_client or use SHA256."
                     )
                 rust_client_options["checksum_algorithm"] = "sha256"
-            self._streaming_write = _parse_streaming_write(rust_client_options.get("streaming_write"))
+            self._streaming_write_options = _parse_streaming_write(rust_client_options.get("streaming_write"))
             self._rust_client = self._create_rust_client(rust_client_options)
 
     @property
@@ -395,10 +395,10 @@ class S3StorageProvider(BaseStorageProvider):
         return normalized
 
     def supports_streaming_write(self) -> bool:
-        return self._rust_client is not None and self._streaming_write is not None
+        return self._rust_client is not None and self._streaming_write_options is not None
 
     def _open_streaming_writer(self, path: str, attributes: dict[str, str] | None) -> StreamingObjectWriter:
-        options = self._streaming_write
+        options = self._streaming_write_options
         if self._rust_client is None or options is None:
             raise NotImplementedError("Streaming writes require rust_client.streaming_write.enabled.")
         rust_client = self._rust_client
