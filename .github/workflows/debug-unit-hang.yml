@@ -1,0 +1,40 @@
+# Temporary: validate the PR #269 hang fix in CI's Nix environment.
+name: Debug unit hang
+on:
+  push:
+    branches:
+      - ci-hang-debug
+  workflow_dispatch:
+jobs:
+  unit:
+    strategy:
+      matrix:
+        python-binary:
+          - python3.12
+          - python3.13
+      fail-fast: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: nix develop ${{ github.workspace }}#"\"${{ matrix.python-binary }}\"" --command bash -e {0}
+    steps:
+      - uses: actions/checkout@v6.1.0
+      - uses: DeterminateSystems/determinate-nix-action@v3.24.2
+        with:
+          summarize: false
+      - working-directory: multi-storage-explorer
+        run: just bundle
+      - working-directory: multi-storage-client
+        run: |
+          just python-binary=${{ matrix.python-binary }} prepare-toolchain
+          just start-storage-systems
+      - working-directory: multi-storage-client
+        timeout-minutes: 35
+        run: |
+          # CI's pytest command (reruns and signal timeouts included), plus verbose results.
+          uv run pytest --cov --cov-report term --durations 10 --numprocesses auto --timeout 120 -v \
+            --ignore tests/test_multistorageclient/unit/contrib/test_ray.py 2>&1 | tee /tmp/pytest.log \
+            | grep -E "test_streaming_write|RERUN|^=+ .* in |^FAILED"
